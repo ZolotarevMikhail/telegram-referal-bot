@@ -1,0 +1,10 @@
+# Секреты и локальные данные — никогда в репозиторий
+.env
+refbot.db
+refbot.db-shm
+refbot.db-wal
+
+# Служебное
+__pycache__/
+*.pyc
+.DS_Store
