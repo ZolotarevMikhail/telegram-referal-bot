@@ -34,7 +34,8 @@ POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "").strip()
 
 # Админы — список Telegram-ID через запятую, например: 123456789,987654321
 ADMIN_IDS = {
-    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().isdigit()
+    int(raw_id) for raw_id in os.getenv("ADMIN_IDS", "")
+    .replace(" ", "").split(",") if raw_id.strip().isdigit()
 }
 
 if not BOT_TOKEN:
@@ -43,67 +44,104 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refbot.db")
-db_lock = threading.Lock()  # база — один файл, обращения из двух потоков надо блокировать
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "refbot.db")
+db_lock = threading.Lock()  # база — один файл, обращения из двух потоков
+# надо блокировать
+
+# Код из реферальной ссылки: латиница/цифры/дефис/подчерк, 3-64 символа
+REF_CODE_PATTERN = r"[A-Za-z0-9_-]{3,64}"
 
 
 # --- База (SQLite, один файл рядом с ботом) ---
 
+SQL_CREATE_USERS = (
+    "CREATE TABLE IF NOT EXISTS users ("
+    " tg_id INTEGER PRIMARY KEY,"
+    " ref_id TEXT NOT NULL UNIQUE,"
+    " granted INTEGER NOT NULL DEFAULT 0,"
+    " granted_at TEXT)"
+)
+SQL_CREATE_SETTINGS = (
+    "CREATE TABLE IF NOT EXISTS settings "
+    "(key TEXT PRIMARY KEY, value TEXT)"
+)
+
+
 def init_db():
+    """Создать таблицы базы, если их ещё нет."""
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS users ("
-            " tg_id INTEGER PRIMARY KEY,"
-            " ref_id TEXT NOT NULL UNIQUE,"
-            " granted INTEGER NOT NULL DEFAULT 0,"
-            " granted_at TEXT)"
-        )
-        conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(SQL_CREATE_USERS)
+        conn.execute(SQL_CREATE_SETTINGS)
         conn.commit()
         conn.close()
 
 
 def db_exec(query, params=()):
+    """Один запрос к базе: выполнить, зафиксировать, вернуть строки."""
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute(query, params)
+        cursor = conn.execute(query, params)
         conn.commit()
-        result = cur.fetchall()
+        result = cursor.fetchall()
         conn.close()
         return result
 
 
 def save_pair(ref_id, tg_id):
-    """Запомнить пару «код ↔ пользователь». Если пара уже есть — ничего не менять."""
+    """Запомнить пару «код ↔ пользователь».
+
+    Если пара уже есть — ничего не менять (INSERT OR IGNORE).
+    """
     db_exec(
-        "INSERT OR IGNORE INTO users (tg_id, ref_id) VALUES (?, ?)", (tg_id, ref_id)
+        "INSERT OR IGNORE INTO users (tg_id, ref_id) VALUES (?, ?)",
+        (tg_id, ref_id),
     )
 
 
 def find_by_ref(ref_id):
-    rows = db_exec("SELECT tg_id, granted FROM users WHERE ref_id = ?", (ref_id,))
+    """Найти пользователя по реферальному коду (или None)."""
+    rows = db_exec("SELECT tg_id, granted FROM users WHERE ref_id = ?",
+                   (ref_id,))
+    return rows[0] if rows else None
+
+
+def find_by_tg_id(tg_id):
+    """Найти пользователя по Telegram-ID (или None). Нужно для /grant."""
+    rows = db_exec("SELECT tg_id, granted FROM users WHERE tg_id = ?",
+                   (int(tg_id),))
     return rows[0] if rows else None
 
 
 def is_granted(tg_id):
+    """Выдан ли уже доступ этому пользователю."""
     rows = db_exec("SELECT granted FROM users WHERE tg_id = ?", (tg_id,))
     return bool(rows and rows[0][0])
 
 
 def mark_granted(tg_id):
+    """Отметить пользователя как получившего доступ.
+
+    Условие «AND granted = 0» защищает от перезаписи даты повторной
+    выдачей.
+    """
+    granted_at = datetime.now().isoformat(timespec="seconds")
     db_exec(
-        "UPDATE users SET granted = 1, granted_at = ? WHERE tg_id = ? AND granted = 0",
-        (datetime.now().isoformat(timespec="seconds"), tg_id),
+        "UPDATE users SET granted = 1, granted_at = ? "
+        "WHERE tg_id = ? AND granted = 0",
+        (granted_at, tg_id),
     )
 
 
 def get_group_id():
+    """ID группы для приглашений (None, если ещё не задан)."""
     rows = db_exec("SELECT value FROM settings WHERE key = 'group_id'")
     return int(rows[0][0]) if rows else None
 
 
 def set_group_id(group_id):
+    """Запомнить ID группы (вставка или обновление)."""
     db_exec(
         "INSERT INTO settings (key, value) VALUES ('group_id', ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -114,21 +152,27 @@ def set_group_id(group_id):
 # --- Выдача доступа ---
 
 def grant_user(tg_id):
-    """Выдать доступ: создать одноразовую ссылку в группу и отправить пользователю.
-    Возвращает (успех, текст для админа/лога)."""
+    """Выдать доступ пользователю: одноразовая ссылка в группу.
+
+    Возвращает (успех, текст для админа/лога).
+    """
     if is_granted(tg_id):
         return False, "доступ уже выдан ранее"
     group_id = get_group_id()
     if group_id is None:
-        return False, "группа не задана — админ должен прислать /setgroup в группе"
+        return False, ("группа не задана — "
+                       "админ должен прислать /setgroup в группе")
     try:
-        link = bot.create_chat_invite_link(group_id, member_limit=1).invite_link
+        invite_link = bot.create_chat_invite_link(
+            group_id, member_limit=1
+        ).invite_link
         bot.send_message(
             tg_id,
-            "Условие выполнено! Приглашение в группу (ссылка одноразовая):\n" + link,
+            "Условие выполнено! Приглашение в группу "
+            "(ссылка одноразовая):\n" + invite_link,
         )
-    except Exception as e:
-        return False, f"ошибка выдачи: {e}"
+    except Exception as error:
+        return False, f"ошибка выдачи: {error}"
     mark_granted(tg_id)
     return True, "доступ выдан"
 
@@ -136,10 +180,12 @@ def grant_user(tg_id):
 def process_postback(ref_id, status):
     """Обработать postback от партнёрской системы. Возвращает текст-ответ."""
     if status != STATUS_OK:
-        return f"postback по коду {ref_id}: действие отклонено (status={status}), доступ не выдан"
+        return ("postback по коду {}: действие отклонено "
+                "(status={}), доступ не выдан").format(ref_id, status)
     user = find_by_ref(ref_id)
     if user is None:
-        return f"postback по коду {ref_id}: пользователь не найден (не заходил в бота)"
+        return ("postback по коду {}: пользователь не найден "
+                "(не заходил в бота)").format(ref_id)
     tg_id = user[0]
     ok, why = grant_user(tg_id)
     return f"postback по коду {ref_id}: {why}"
@@ -147,23 +193,29 @@ def process_postback(ref_id, status):
 
 # --- Команды бота ---
 
+def split_start_payload(message_text):
+    """Код из текста /start: всё после первого пробела (или пусто)."""
+    parts = message_text.split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
 @bot.message_handler(commands=["start"], chat_types=["private"])
 def cmd_start(m):
-    parts = m.text.split(maxsplit=1)
-    payload = parts[1].strip() if len(parts) > 1 else ""
-    # Код из реферальной ссылки: латиница/цифры/дефис/подчерк, от 3 до 64 символов
-    if not re.fullmatch(r"[A-Za-z0-9_-]{3,64}", payload):
+    payload = split_start_payload(m.text)
+    if not re.fullmatch(REF_CODE_PATTERN, payload):
         bot.reply_to(
             m,
             "Привет! Это бот-привратник приватной группы.\n"
-            "Заходите по своей персональной ссылке — дальше всё автоматически.",
+            "Заходите по своей персональной ссылке — "
+            "дальше всё автоматически.",
         )
         return
     save_pair(payload, m.from_user.id)
     bot.reply_to(
         m,
         f"Принято! Ваш код: {payload}.\n"
-        "Когда партнёрская система подтвердит действие, я пришлю приглашение в группу автоматически.",
+        "Когда партнёрская система подтвердит действие, "
+        "я пришлю приглашение в группу автоматически.",
     )
 
 
@@ -173,24 +225,30 @@ def cmd_help(m):
         m,
         "Я выдаю доступ в приватную группу автоматически.\n"
         "• Зайдите по персональной ссылке — я запомню вас.\n"
-        "• После подтверждения действия придёт одноразовая ссылка-приглашение.",
+        "• После подтверждения действия придёт "
+        "одноразовая ссылка-приглашение.",
     )
 
 
 def is_admin(tg_id):
+    """Является ли отправитель админом (список в .env)."""
     return tg_id in ADMIN_IDS
 
 
 @bot.message_handler(commands=["setgroup"])
 def cmd_setgroup(m):
-    """Админ присылает /setgroup прямо в целевой группе — бот запоминает её."""
+    """Админ присылает /setgroup прямо в целевой группе — бот запоминает."""
     if not is_admin(m.from_user.id):
         return  # молча игнорируем чужих
     if m.chat.type not in ("group", "supergroup"):
         bot.reply_to(m, "Эту команду нужно прислать в самой группе.")
         return
     set_group_id(m.chat.id)
-    bot.reply_to(m, "Группа запомнена. Теперь я выдаю сюда одноразовые приглашения.")
+    bot.reply_to(
+        m,
+        "Группа запомнена. Теперь я выдаю сюда "
+        "одноразовые приглашения.",
+    )
 
 
 @bot.message_handler(commands=["grant"], chat_types=["private"])
@@ -205,10 +263,13 @@ def cmd_grant(m):
     key = parts[1].strip()
     user = find_by_ref(key)
     if user is None and key.isdigit():
-        rows = db_exec("SELECT tg_id, granted FROM users WHERE tg_id = ?", (int(key),))
-        user = rows[0] if rows else None
+        user = find_by_tg_id(key)
     if user is None:
-        bot.reply_to(m, f"Пользователь {key} не найден — он не заходил в бота.")
+        bot.reply_to(
+            m,
+            f"Пользователь {key} не найден — "
+            "он не заходил в бота.",
+        )
         return
     tg_id = user[0]
     ok, why = grant_user(tg_id)
@@ -218,15 +279,21 @@ def cmd_grant(m):
 # --- HTTP-сервер для postback (партнёрская система стучится по ссылке) ---
 
 class PostbackHandler(BaseHTTPRequestHandler):
+    """Обрабатывает GET /postback?ref_id=...&status=..."""
+
     def do_GET(self):
         url = urlparse(self.path)
         if url.path != "/postback":
             self.send_json(404, {"error": "unknown path"})
             return
-        q = parse_qs(url.query)
-        ref_id = q.get("ref_id", [""])[0].strip()
-        status = q.get("status", [""])[0].strip()
-        if POSTBACK_SECRET and q.get("secret", [""])[0].strip() != POSTBACK_SECRET:
+        query = parse_qs(url.query)
+        ref_id = query.get("ref_id", [""])[0].strip()
+        status = query.get("status", [""])[0].strip()
+        has_bad_secret = (
+            POSTBACK_SECRET
+            and query.get("secret", [""])[0].strip() != POSTBACK_SECRET
+        )
+        if has_bad_secret:
             self.send_json(403, {"error": "bad secret"})
             return
         if not ref_id:
@@ -237,7 +304,9 @@ class PostbackHandler(BaseHTTPRequestHandler):
         self.send_json(200, {"result": answer})
 
     def send_json(self, code, obj):
-        body = f'{{"result": "{obj.get("result", obj.get("error", ""))}"}}'.encode("utf-8")
+        """Ответ в одном формате: {"result": "..."}; заголовки как были."""
+        result_text = obj.get("result", obj.get("error", ""))
+        body = f'{{"result": "{result_text}"}}'.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -248,9 +317,12 @@ class PostbackHandler(BaseHTTPRequestHandler):
 
 
 def start_postback_server():
+    """Поднять фоновый HTTP-сервер для postback."""
     server = ThreadingHTTPServer(("0.0.0.0", POSTBACK_PORT), PostbackHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    server_thread = threading.Thread(
+        target=server.serve_forever, daemon=True
+    )
+    server_thread.start()
     print(f"Postback-сервер слушает порт {POSTBACK_PORT}")
 
 
